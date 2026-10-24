@@ -447,8 +447,24 @@ input[type="checkbox"]{width:18px;height:18px;min-height:0;padding:0;margin:0;ac
   .hero.play .portrait{animation:none}
   .portrait,.cover.has-img img,.photo-btn img,.tool-btn{transition:none}
 }
+
+/* ---------- Backdrop: topographic contours + drifting glows ---------- */
+.backdrop{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+.backdrop canvas{position:absolute;left:0;top:0;display:block}
+#topo-hi{opacity:0;transition:opacity .5s ease;
+  -webkit-mask-image:radial-gradient(240px circle at var(--mx,-600px) var(--my,-600px),#000 0,rgba(0,0,0,.35) 45%,transparent 72%);
+  mask-image:radial-gradient(240px circle at var(--mx,-600px) var(--my,-600px),#000 0,rgba(0,0,0,.35) 45%,transparent 72%)}
+.backdrop.lit #topo-hi{opacity:1}
+.glow{position:absolute;width:72vmax;height:72vmax;border-radius:50%}
+.g1{top:-32vmax;right:-26vmax;background:radial-gradient(circle,color-mix(in srgb,var(--marigold) 22%,transparent) 0,transparent 62%);animation:drift1 40s ease-in-out infinite alternate}
+.g2{bottom:-36vmax;left:-28vmax;background:radial-gradient(circle,color-mix(in srgb,var(--accent) 20%,transparent) 0,transparent 62%);animation:drift2 52s ease-in-out infinite alternate}
+@keyframes drift1{to{transform:translate(-14vmax,12vmax) scale(1.12)}}
+@keyframes drift2{to{transform:translate(16vmax,-10vmax) scale(1.18)}}
+.contact{background:color-mix(in srgb,var(--surface) 86%,transparent)}
+@media (prefers-reduced-motion: reduce){.g1,.g2{animation:none}}
 </style>
 
+<div class="backdrop" id="backdrop" aria-hidden="true"><span class="glow g1"></span><span class="glow g2"></span><canvas id="topo"></canvas><canvas id="topo-hi"></canvas></div>
 <div class="wipe" aria-hidden="true"><span class="wipe-label"></span></div>
 <div class="cursor" aria-hidden="true"><div class="cursor-ring"><span class="cursor-label"></span></div></div>
 
@@ -1120,7 +1136,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = SITE;
       if (!C) colors();
       var t = reduce ? 0 : (time - t0) / 1000;
       var step = W < 520 ? 5 : 6, hot = -1, peakX = 0, peakY = 1e9;
-      ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+      ctx.clearRect(0, 0, W, H);
       if (P.s > 0.15){
         var best = 1e9;
         for (var a = 0; a < L; a++){ var dd = Math.abs(base(a) - P.y); if (dd < best){ best = dd; hot = a; } }
@@ -1186,7 +1202,92 @@ if (typeof module !== 'undefined' && module.exports) module.exports = SITE;
     };
   }
   var range = makeRange(document.getElementById('range'));
-  function retheme(){ if (range) range.retheme(); }
+
+  /* ---------- Backdrop: a topographic map (contour lines, every 4th one heavier like a real
+     index contour) behind the whole site. On desktop the cursor lights up the lines near it. ---------- */
+  function makeTopo(){
+    var wrap = document.getElementById('backdrop');
+    if (!wrap) return null;
+    var base = $('#topo', wrap), hi = $('#topo-hi', wrap);
+    var cb = base.getContext && base.getContext('2d'), ch = hi.getContext && hi.getContext('2d');
+    if (!cb || !ch) return null;
+    function hash(x, y){
+      var h = (Math.imul(x, 374761393) + Math.imul(y, 668265263)) | 0;
+      h = Math.imul(h ^ (h >>> 13), 1274126177);
+      h ^= h >>> 16;
+      return (h >>> 0) / 4294967295;
+    }
+    function noise(x, y){
+      var ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+      var u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+      var a = hash(ix, iy), b = hash(ix + 1, iy), c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+      return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+    }
+    function fbm(x, y){ return noise(x, y) * 0.6 + noise(x * 2.03 + 11.3, y * 2.03 + 7.1) * 0.28 + noise(x * 4.1 + 3.7, y * 4.1 + 19.9) * 0.12; }
+    // Marching-squares segments per cell case (corners: TL=8, TR=4, BR=2, BL=1; edges T,R,B,L)
+    var SEG = { 1:['L','B'], 2:['B','R'], 3:['L','R'], 4:['T','R'], 5:['T','R','L','B'], 6:['T','B'], 7:['T','L'],
+                8:['L','T'], 9:['T','B'], 10:['L','T','R','B'], 11:['T','R'], 12:['L','R'], 13:['R','B'], 14:['L','B'] };
+    var lastW = 0, lastH = 0;
+    function draw(force){
+      var W = window.innerWidth, H = Math.max(window.innerHeight, root.clientHeight);
+      if (!force && W === lastW && H <= lastH) return;
+      lastW = W; lastH = H;
+      var dpr = Math.min(1.5, window.devicePixelRatio || 1);
+      [base, hi].forEach(function(c){ c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); c.style.width = W + 'px'; c.style.height = H + 'px'; });
+      var cs = getComputedStyle(root);
+      var ink = cs.getPropertyValue('--ink').trim(), gold = cs.getPropertyValue('--marigold').trim();
+      var step = 12, cols = Math.ceil(W / step) + 2, rows = Math.ceil(H / step) + 2, scale = W < 600 ? 190 : 290;
+      var val = new Float32Array(cols * rows);
+      for (var j = 0; j < rows; j++) for (var i = 0; i < cols; i++) val[j * cols + i] = fbm(i * step / scale, j * step / scale);
+      function contour(ctx, lv){
+        ctx.beginPath();
+        for (var j = 0; j < rows - 1; j++){
+          for (var i = 0; i < cols - 1; i++){
+            var a = val[j * cols + i], b = val[j * cols + i + 1], c = val[(j + 1) * cols + i + 1], d = val[(j + 1) * cols + i];
+            var idx = (a > lv ? 8 : 0) | (b > lv ? 4 : 0) | (c > lv ? 2 : 0) | (d > lv ? 1 : 0);
+            if (idx === 0 || idx === 15) continue;
+            var P = {
+              T: [(i + (lv - a) / (b - a)) * step, j * step],
+              R: [(i + 1) * step, (j + (lv - b) / (c - b)) * step],
+              B: [(i + (lv - d) / (c - d)) * step, (j + 1) * step],
+              L: [i * step, (j + (lv - a) / (d - a)) * step]
+            };
+            var s = SEG[idx];
+            for (var k = 0; k < s.length; k += 2){ ctx.moveTo(P[s[k]][0], P[s[k]][1]); ctx.lineTo(P[s[k + 1]][0], P[s[k + 1]][1]); }
+          }
+        }
+        ctx.stroke();
+      }
+      [cb, ch].forEach(function(ctx, n){
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, W, H);
+        ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+        for (var k = 1; k <= 16; k++){
+          var lv = 0.18 + k * 0.04, major = k % 4 === 0;
+          ctx.strokeStyle = n === 0 ? ink : gold;
+          ctx.globalAlpha = n === 0 ? (major ? 0.13 : 0.065) : (major ? 0.9 : 0.6);
+          ctx.lineWidth = major ? 1.3 : 0.9;
+          contour(ctx, lv);
+        }
+        ctx.globalAlpha = 1;
+      });
+    }
+    var rt = 0;
+    window.addEventListener('resize', function(){ clearTimeout(rt); rt = setTimeout(function(){ draw(false); }, 180); });
+    if (finePointer && !reduce){
+      var pending = false, px = 0, py = 0;
+      window.addEventListener('pointermove', function(e){
+        if (e.pointerType && e.pointerType !== 'mouse') return;
+        px = e.clientX; py = e.clientY;
+        if (!pending){ pending = true; requestAnimationFrame(function(){ pending = false; wrap.style.setProperty('--mx', px + 'px'); wrap.style.setProperty('--my', py + 'px'); wrap.classList.add('lit'); }); }
+      }, { passive: true });
+      root.addEventListener('mouseleave', function(){ wrap.classList.remove('lit'); });
+    }
+    draw(true);
+    return { redraw: function(){ draw(true); } };
+  }
+  var topo = makeTopo();
+  function retheme(){ if (range) range.retheme(); if (topo) topo.redraw(); }
   var darkMq = mq('(prefers-color-scheme: dark)');
   if (darkMq.addEventListener) darkMq.addEventListener('change', retheme);
   if ('MutationObserver' in window) new MutationObserver(retheme).observe(root, { attributes: true, attributeFilter: ['data-theme', 'class'] });
